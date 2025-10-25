@@ -56,6 +56,14 @@ contract LendingCore {
         address indexed market,
         uint256 amount
     );
+    event LiquidationProcessed(
+        address indexed liquidator,
+        address indexed borrower,
+        address cTokenBorrowed,
+        address cTokenCollateral,
+        uint256 repayAmount,
+        uint256 seizeTokens
+    );
 
     // Tracks which markets have accrued interest this block (prevents double accrual)
     mapping(address => uint256) private lastAccrualBlock;
@@ -178,6 +186,49 @@ contract LendingCore {
     }
 
     /**
+     * @notice Processes liquidation operations
+     * @dev Processes all liquidations for a given market pair
+     * @param liquidationStore All liquidation requests for this market pair
+     * @param cTokenBorrowed The market where debt is being repaid
+     * @param cTokenCollateral The market where collateral is being seized
+     * @param netRepay Total repay amount (unused for now)
+     * @param netSeize Total seize amount (unused for now)
+     */
+    function processLiquidationOperations(
+        ILendingRequestStore liquidationStore,
+        address cTokenBorrowed,
+        address cTokenCollateral,
+        uint256 netRepay,
+        uint256 netSeize
+    ) external {
+        CToken cTokenBorrow = CToken(cTokenBorrowed);
+        CToken cTokenColl = CToken(cTokenCollateral);
+
+        // Process all liquidations
+        if (address(liquidationStore) != address(0)) {
+            uint256 liquidationCount = liquidationStore.fullLength();
+            for (uint256 i = 0; i < liquidationCount; i++) {
+                if (!liquidationStore.exists(i)) continue;
+
+                // Unpack data: user is liquidator, amount contains packed borrower+repayAmount
+                (, address liquidator, uint256 packedData) = liquidationStore.get(i);
+
+                // Unpack borrower address and repayAmount
+                address borrower = address(uint160(packedData >> 96));
+                uint256 repayAmount = packedData & ((1 << 96) - 1);
+
+                _processLiquidation(
+                    cTokenBorrow,
+                    cTokenColl,
+                    liquidator,
+                    borrower,
+                    repayAmount
+                );
+            }
+        }
+    }
+
+    /**
      * @notice Internal: processes a single deposit
      * @dev Transfers tokens from LendingEngine to CToken and mints cTokens
      */
@@ -262,5 +313,62 @@ contract LendingCore {
         cToken.repayFromLendingCore(user, amount);
 
         emit RepayProcessed(user, address(cToken), amount);
+    }
+
+    /**
+     * @notice Internal: processes a single liquidation
+     * @dev Repays borrower's debt and seizes collateral for liquidator
+     * @param cTokenBorrow The market where debt is being repaid
+     * @param cTokenCollateral The market where collateral is being seized
+     * @param liquidator The address performing the liquidation
+     * @param borrower The underwater borrower being liquidated
+     * @param repayAmount The amount being repaid
+     */
+    function _processLiquidation(
+        CToken cTokenBorrow,
+        CToken cTokenCollateral,
+        address liquidator,
+        address borrower,
+        uint256 repayAmount
+    ) internal {
+        // Verify borrower is still underwater
+        require(address(comptroller) != address(0), "comptroller not set");
+        require(comptroller.isUnderwater(borrower), "borrower not underwater");
+
+        // Get borrower's current debt
+        uint256 borrowBalance = cTokenBorrow.borrowBalanceStored(borrower);
+
+        // Enforce close factor (max 50% of debt can be repaid)
+        uint256 maxClose = (borrowBalance * comptroller.closeFactorMantissa()) / 1e18;
+        if (repayAmount > maxClose) {
+            repayAmount = maxClose;
+        }
+
+        // Calculate collateral to seize
+        (uint256 err, uint256 seizeTokens) = comptroller.liquidateCalculateSeizeTokens(
+            address(cTokenBorrow),
+            address(cTokenCollateral),
+            repayAmount
+        );
+        require(err == 0, "seize calculation failed");
+
+        // Transfer repay tokens from LendingEngine to borrow market
+        address underlyingBorrow = cTokenBorrow.underlying();
+        IERC20(underlyingBorrow).safeTransferFrom(lendingEngine, address(cTokenBorrow), repayAmount);
+
+        // Repay borrower's debt
+        cTokenBorrow.repayFromLendingCore(borrower, repayAmount);
+
+        // Seize collateral from borrower and transfer to liquidator
+        cTokenCollateral.seizeFromLendingCore(liquidator, borrower, seizeTokens);
+
+        emit LiquidationProcessed(
+            liquidator,
+            borrower,
+            address(cTokenBorrow),
+            address(cTokenCollateral),
+            repayAmount,
+            seizeTokens
+        );
     }
 }

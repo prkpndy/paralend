@@ -487,4 +487,29 @@ contract CToken is ExponentialNoError {
 
         emit RepayBorrow(address(0), user, repayAmount, accountBorrowsNew, totalBorrowsNew);
     }
+
+    /**
+     * @notice Seizes collateral from borrower and transfers to liquidator (called by LendingCore during liquidation)
+     * @dev Skips interest accrual and checks - those are done by LendingCore
+     * @param liquidator Address receiving the seized collateral
+     * @param borrower Address whose collateral is being seized
+     * @param seizeTokens Amount of cTokens to seize
+     */
+    function seizeFromLendingCore(
+        address liquidator,
+        address borrower,
+        uint256 seizeTokens
+    ) external {
+        require(msg.sender == lendingCore, "unauthorized: only lending core");
+
+        // Check borrower has enough cTokens
+        require(accountTokens[borrower] >= seizeTokens, "insufficient collateral");
+
+        // Transfer cTokens from borrower to liquidator
+        accountTokens[borrower] = sub_(accountTokens[borrower], seizeTokens);
+        accountTokens[liquidator] = add_(accountTokens[liquidator], seizeTokens);
+
+        // Emit transfer event (for ERC20 compatibility if needed)
+        // Note: totalSupply unchanged - just transferring between accounts
+    }
 }

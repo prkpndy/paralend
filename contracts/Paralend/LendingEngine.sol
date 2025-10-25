@@ -9,6 +9,7 @@ import "@arcologynetwork/concurrentlib/lib/orderedset/OrderedSet.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "./LendingRequestStore.sol";
+import "./SimplifiedComptroller.sol";
 import "./interfaces/ILendingCore.sol";
 import "./interfaces/ILendingRequestStore.sol";
 import "../CompoundV2/CToken.sol";
@@ -42,6 +43,9 @@ contract LendingEngine {
 
     // Address of core lending logic contract
     address private lendingCore;
+
+    // Address of comptroller for liquidation checks
+    SimplifiedComptroller public comptroller;
 
     /// @notice Event emitted after batch processing
     event BatchProcessed(
@@ -82,6 +86,15 @@ contract LendingEngine {
     // Cumulative repay totals per market
     mapping(address => U256Cumulative) private repayTotals;
 
+    // Liquidation requests per market pair (borrowMarket => collateralMarket => store)
+    mapping(address => mapping(address => LendingRequestStore)) private liquidationRequests;
+
+    // Cumulative liquidation repay totals per borrow market
+    mapping(address => U256Cumulative) private liquidationRepayTotals;
+
+    // Cumulative liquidation seize totals per collateral market
+    mapping(address => U256Cumulative) private liquidationSeizeTotals;
+
     // TODO: Check if we can remove this or if we should add the function string in constant
     // Function signatures for deferred execution
     // bytes4 private constant DEPOSIT_SIGN =
@@ -99,6 +112,7 @@ contract LendingEngine {
         Runtime.defer("queueWithdraw(address,uint256)", 300000);
         Runtime.defer("queueBorrow(address,uint256)", 300000);
         Runtime.defer("queueRepay(address,uint256)", 300000);
+        Runtime.defer("queueLiquidation(address,address,address,uint256)", 300000);
     }
 
     /**
@@ -113,6 +127,16 @@ contract LendingEngine {
         require(lendingCore == address(0), "already initialized");
         require(_lendingCore != address(0), "invalid address");
         lendingCore = _lendingCore;
+    }
+
+    /**
+     * @notice Sets the comptroller address
+     * @param _comptroller Address of the SimplifiedComptroller
+     */
+    function setComptroller(address _comptroller) external {
+        require(address(comptroller) == address(0), "comptroller already set");
+        require(_comptroller != address(0), "invalid comptroller");
+        comptroller = SimplifiedComptroller(_comptroller);
     }
 
     /**
@@ -226,6 +250,74 @@ contract LendingEngine {
         repayRequests[market].push(pid, msg.sender, amount);
         repayTotals[market].add(amount);
 
+        if (Runtime.isInDeferred()) {
+            _processBatch();
+        }
+
+        return 0;
+    }
+
+    /**
+     * @notice Queues a liquidation request for batch processing
+     * @dev Liquidator repays borrower's debt and receives collateral
+     * @param borrower The underwater borrower to liquidate
+     * @param cTokenBorrowed The market where debt is being repaid
+     * @param cTokenCollateral The market where collateral is being seized
+     * @param repayAmount Amount to repay (will be capped at close factor)
+     */
+    function queueLiquidation(
+        address borrower,
+        address cTokenBorrowed,
+        address cTokenCollateral,
+        uint256 repayAmount
+    ) external returns (uint256) {
+        bytes32 pid = abi.decode(Runtime.pid(), (bytes32));
+
+        // Verify borrower is underwater using comptroller
+        require(address(comptroller) != address(0), "comptroller not set");
+        require(comptroller.isUnderwater(borrower), "borrower not underwater");
+
+        // Get underlying token for borrowed market and transfer from liquidator
+        address underlying = CToken(cTokenBorrowed).underlying();
+        IERC20(underlying).safeTransferFrom(msg.sender, address(this), repayAmount);
+
+        // Initialize request store if needed
+        if (address(liquidationRequests[cTokenBorrowed][cTokenCollateral]) == address(0)) {
+            liquidationRequests[cTokenBorrowed][cTokenCollateral] = new LendingRequestStore(false);
+        }
+
+        // Initialize totals if needed
+        if (address(liquidationRepayTotals[cTokenBorrowed]) == address(0)) {
+            liquidationRepayTotals[cTokenBorrowed] = new U256Cumulative(0, type(uint256).max);
+        }
+        if (address(liquidationSeizeTotals[cTokenCollateral]) == address(0)) {
+            liquidationSeizeTotals[cTokenCollateral] = new U256Cumulative(0, type(uint256).max);
+        }
+
+        // Track both markets as active
+        activeMarkets.set(abi.encodePacked(cTokenBorrowed));
+        activeMarkets.set(abi.encodePacked(cTokenCollateral));
+
+        // Pack borrower address and repayAmount into single uint256
+        // Upper 160 bits: borrower address, Lower 96 bits: repayAmount (truncated)
+        uint256 packedData = (uint256(uint160(borrower)) << 96) | (repayAmount & ((1 << 96) - 1));
+
+        // Store liquidation request (liquidator as user, packed data as amount)
+        liquidationRequests[cTokenBorrowed][cTokenCollateral].push(pid, msg.sender, packedData);
+
+        // Accumulate repay total
+        liquidationRepayTotals[cTokenBorrowed].add(repayAmount);
+
+        // Calculate and accumulate seize amount
+        (uint256 err, uint256 seizeTokens) = comptroller.liquidateCalculateSeizeTokens(
+            cTokenBorrowed,
+            cTokenCollateral,
+            repayAmount
+        );
+        require(err == 0, "seize calculation failed");
+        liquidationSeizeTotals[cTokenCollateral].add(seizeTokens);
+
+        // If in deferred phase, process all markets
         if (Runtime.isInDeferred()) {
             _processBatch();
         }
