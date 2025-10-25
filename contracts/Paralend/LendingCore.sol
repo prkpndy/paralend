@@ -3,6 +3,7 @@ pragma solidity =0.7.6;
 pragma abicoder v2;
 
 import "./interfaces/ILendingRequestStore.sol";
+import "./SimplifiedComptroller.sol";
 import "../CompoundV2/CToken.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
@@ -29,6 +30,9 @@ contract LendingCore {
 
     /// @notice Address of the LendingEngine that queues operations
     address public lendingEngine;
+
+    /// @notice Comptroller for collateral and liquidity checks
+    SimplifiedComptroller public comptroller;
 
     event DepositProcessed(
         address indexed user,
@@ -63,6 +67,16 @@ contract LendingCore {
     constructor(address _lendingEngine) {
         require(_lendingEngine != address(0), "invalid lending engine");
         lendingEngine = _lendingEngine;
+    }
+
+    /**
+     * @notice Sets the comptroller address (can only be set once)
+     * @param _comptroller Address of the SimplifiedComptroller
+     */
+    function setComptroller(address _comptroller) external {
+        require(address(comptroller) == address(0), "comptroller already set");
+        require(_comptroller != address(0), "invalid comptroller");
+        comptroller = SimplifiedComptroller(_comptroller);
     }
 
     /**
@@ -214,8 +228,12 @@ contract LendingCore {
         address user,
         uint256 amount
     ) internal {
-        // TODO: Add collateral check (comptroller.borrowAllowed())
-        // For now, allow all borrows (unsafe for production!)
+        // Check collateral using comptroller
+        require(address(comptroller) != address(0), "comptroller not set");
+        require(
+            comptroller.borrowAllowed(address(cToken), user, amount),
+            "insufficient collateral"
+        );
 
         // Call CToken to update borrow state
         cToken.borrowFromLendingCore(user, amount);

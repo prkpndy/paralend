@@ -129,6 +129,31 @@ contract CToken is ExponentialNoError {
     }
 
     /**
+     * @notice Get account snapshot for comptroller
+     * @param account The account to get snapshot for
+     * @return error Error code (0 = success)
+     * @return cTokenBalance The cToken balance
+     * @return borrowBalance The borrow balance (with accrued interest)
+     * @return exchangeRateMantissa The current exchange rate
+     */
+    function getAccountSnapshot(address account)
+        external
+        view
+        returns (
+            uint256 error,
+            uint256 cTokenBalance,
+            uint256 borrowBalance,
+            uint256 exchangeRateMantissa
+        )
+    {
+        cTokenBalance = accountTokens[account];
+        borrowBalance = borrowBalanceStored(account);
+        exchangeRateMantissa = exchangeRateStored();
+
+        return (0, cTokenBalance, borrowBalance, exchangeRateMantissa);
+    }
+
+    /**
      * @notice Get cash balance of this cToken in the underlying asset
      * @return The quantity of underlying asset owned by this contract
      */
