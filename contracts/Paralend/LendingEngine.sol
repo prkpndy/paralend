@@ -77,15 +77,16 @@ contract LendingEngine {
     // Cumulative repay totals per market
     mapping(address => U256Cumulative) private repayTotals;
 
+    // TODO: Check if we can remove this or if we should add the function string in constant
     // Function signatures for deferred execution
-    bytes4 private constant DEPOSIT_SIGN =
-        bytes4(keccak256("queueDeposit(address,uint256)"));
-    bytes4 private constant WITHDRAW_SIGN =
-        bytes4(keccak256("queueWithdraw(address,uint256)"));
-    bytes4 private constant BORROW_SIGN =
-        bytes4(keccak256("queueBorrow(address,uint256)"));
-    bytes4 private constant REPAY_SIGN =
-        bytes4(keccak256("queueRepay(address,uint256)"));
+    // bytes4 private constant DEPOSIT_SIGN =
+    //     bytes4(keccak256("queueDeposit(address,uint256)"));
+    // bytes4 private constant WITHDRAW_SIGN =
+    //     bytes4(keccak256("queueWithdraw(address,uint256)"));
+    // bytes4 private constant BORROW_SIGN =
+    //     bytes4(keccak256("queueBorrow(address,uint256)"));
+    // bytes4 private constant REPAY_SIGN =
+    //     bytes4(keccak256("queueRepay(address,uint256)"));
 
     constructor() {
         // Register deferred execution for all operation types

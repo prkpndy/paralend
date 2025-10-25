@@ -80,6 +80,7 @@ contract LendingCore {
         ILendingRequestStore depositStore,
         ILendingRequestStore withdrawStore,
         address market,
+        // TODO: Check if netDeposit and netWithdraw arguments can be removed
         uint256 netDeposit,
         uint256 netWithdraw
     ) external {
@@ -121,6 +122,7 @@ contract LendingCore {
         ILendingRequestStore borrowStore,
         ILendingRequestStore repayStore,
         address market,
+        // TODO: Check if netBorrow and netWithdraw arguments can be removed
         uint256 netBorrow,
         uint256 netRepay
     ) external {
