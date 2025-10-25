@@ -1,0 +1,312 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity =0.7.6;
+pragma abicoder v2;
+
+import "@arcologynetwork/concurrentlib/lib/runtime/Runtime.sol";
+import "@arcologynetwork/concurrentlib/lib/commutative/U256Cum.sol";
+import "@arcologynetwork/concurrentlib/lib/multiprocess/Multiprocess.sol";
+import "@arcologynetwork/concurrentlib/lib/orderedset/OrderedSet.sol";
+import "./LendingRequestStore.sol";
+import "./interfaces/ILendingCore.sol";
+import "./interfaces/ILendingRequestStore.sol";
+
+/**
+ * @title LendingEngine
+ * @notice Parallel execution engine for lending operations with deposit/withdraw and borrow/repay netting
+ * @dev Architecture mirrors NettingEngine from the swap protocol
+ *
+ * Key Innovation:
+ * - Collects all lending operations in parallel (Phase 1)
+ * - Calculates net flows per market (deposits-withdraws, borrows-repays)
+ * - Accrues interest ONCE per market instead of per transaction
+ * - Processes all operations in parallel using 20 threads (Phase 2)
+ *
+ * Example:
+ * Phase 1: Collect
+ *   - 100 users deposit 1000 ETH total
+ *   - 60 users withdraw 400 ETH total
+ *   - 50 users borrow 300 ETH total
+ *   - 30 users repay 100 ETH total
+ *
+ * Phase 2: Process
+ *   - Accrue interest ONCE
+ *   - Net deposit = 1000 - 400 = 600 ETH (single state update)
+ *   - Net borrow = 300 - 100 = 200 ETH (single state update)
+ *   - Process 240 operations in parallel across 20 threads
+ */
+contract LendingEngine {
+    // Address of core lending logic contract
+    address private lendingCore;
+
+    /// @notice Event emitted after batch processing
+    event BatchProcessed(
+        address indexed market,
+        uint256 deposits,
+        uint256 withdraws,
+        uint256 borrows,
+        uint256 repays
+    );
+
+    // Multiprocessor with 20 threads for parallel market processing
+    Multiprocess private mp = new Multiprocess(20);
+
+    // Set of active markets in current batch
+    BytesOrderedSet private activeMarkets = new BytesOrderedSet(false);
+
+    // Deposit requests per market
+    mapping(address => LendingRequestStore) private depositRequests;
+
+    // Withdraw requests per market
+    mapping(address => LendingRequestStore) private withdrawRequests;
+
+    // Borrow requests per market
+    mapping(address => LendingRequestStore) private borrowRequests;
+
+    // Repay requests per market
+    mapping(address => LendingRequestStore) private repayRequests;
+
+    // Cumulative deposit totals per market
+    mapping(address => U256Cumulative) private depositTotals;
+
+    // Cumulative withdraw totals per market
+    mapping(address => U256Cumulative) private withdrawTotals;
+
+    // Cumulative borrow totals per market
+    mapping(address => U256Cumulative) private borrowTotals;
+
+    // Cumulative repay totals per market
+    mapping(address => U256Cumulative) private repayTotals;
+
+    // Function signatures for deferred execution
+    bytes4 private constant DEPOSIT_SIGN =
+        bytes4(keccak256("queueDeposit(address,uint256)"));
+    bytes4 private constant WITHDRAW_SIGN =
+        bytes4(keccak256("queueWithdraw(address,uint256)"));
+    bytes4 private constant BORROW_SIGN =
+        bytes4(keccak256("queueBorrow(address,uint256)"));
+    bytes4 private constant REPAY_SIGN =
+        bytes4(keccak256("queueRepay(address,uint256)"));
+
+    constructor() {
+        // Register deferred execution for all operation types
+        Runtime.defer("queueDeposit(address,uint256)", 300000);
+        Runtime.defer("queueWithdraw(address,uint256)", 300000);
+        Runtime.defer("queueBorrow(address,uint256)", 300000);
+        Runtime.defer("queueRepay(address,uint256)", 300000);
+    }
+
+    /**
+     * @notice Initializes the lending core contract
+     */
+    function init(address _lendingCore) external {
+        lendingCore = _lendingCore;
+    }
+
+    /**
+     * @notice Registers a new market and initializes storage structures
+     */
+    function initMarket(address market) external {
+        depositRequests[market] = new LendingRequestStore(false);
+        withdrawRequests[market] = new LendingRequestStore(false);
+        borrowRequests[market] = new LendingRequestStore(false);
+        repayRequests[market] = new LendingRequestStore(false);
+
+        depositTotals[market] = new U256Cumulative(0, type(uint256).max);
+        withdrawTotals[market] = new U256Cumulative(0, type(uint256).max);
+        borrowTotals[market] = new U256Cumulative(0, type(uint256).max);
+        repayTotals[market] = new U256Cumulative(0, type(uint256).max);
+    }
+
+    /**
+     * @notice Queues a deposit request for batch processing
+     * @dev Phase 1: Collect requests in parallel, Phase 2: Process batch
+     * @param market CToken market address
+     * @param amount Deposit amount
+     */
+    function queueDeposit(
+        address market,
+        uint256 amount
+    ) external returns (uint256) {
+        bytes32 pid = abi.decode(Runtime.pid(), (bytes32));
+
+        // Track active market
+        activeMarkets.set(abi.encodePacked(market));
+
+        // Store request
+        depositRequests[market].push(pid, msg.sender, amount);
+
+        // Accumulate total
+        depositTotals[market].add(amount);
+
+        // Transfer tokens to lending core
+        // Note: In production, add token transfer logic here
+
+        // If in deferred phase, process all markets
+        if (Runtime.isInDeferred()) {
+            _processBatch();
+        }
+
+        return 0;
+    }
+
+    /**
+     * @notice Queues a withdraw request for batch processing
+     * @param market CToken market address
+     * @param amount Withdraw amount (in cTokens)
+     */
+    function queueWithdraw(
+        address market,
+        uint256 amount
+    ) external returns (uint256) {
+        bytes32 pid = abi.decode(Runtime.pid(), (bytes32));
+
+        activeMarkets.set(abi.encodePacked(market));
+        withdrawRequests[market].push(pid, msg.sender, amount);
+        withdrawTotals[market].add(amount);
+
+        if (Runtime.isInDeferred()) {
+            _processBatch();
+        }
+
+        return 0;
+    }
+
+    /**
+     * @notice Queues a borrow request for batch processing
+     * @param market CToken market address
+     * @param amount Borrow amount
+     */
+    function queueBorrow(
+        address market,
+        uint256 amount
+    ) external returns (uint256) {
+        bytes32 pid = abi.decode(Runtime.pid(), (bytes32));
+
+        activeMarkets.set(abi.encodePacked(market));
+        borrowRequests[market].push(pid, msg.sender, amount);
+        borrowTotals[market].add(amount);
+
+        if (Runtime.isInDeferred()) {
+            _processBatch();
+        }
+
+        return 0;
+    }
+
+    /**
+     * @notice Queues a repay request for batch processing
+     * @param market CToken market address
+     * @param amount Repay amount
+     */
+    function queueRepay(
+        address market,
+        uint256 amount
+    ) external returns (uint256) {
+        bytes32 pid = abi.decode(Runtime.pid(), (bytes32));
+
+        activeMarkets.set(abi.encodePacked(market));
+        repayRequests[market].push(pid, msg.sender, amount);
+        repayTotals[market].add(amount);
+
+        if (Runtime.isInDeferred()) {
+            _processBatch();
+        }
+
+        return 0;
+    }
+
+    /**
+     * @notice Processes all markets in parallel during deferred phase
+     * @dev Creates one job per active market, runs on 20 parallel threads
+     */
+    function _processBatch() internal {
+        uint256 length = activeMarkets.Length();
+
+        for (uint256 idx = 0; idx < length; idx++) {
+            mp.addJob(
+                1000000000,
+                0,
+                address(this),
+                abi.encodeWithSignature(
+                    "processMarket(address)",
+                    _parseAddr(activeMarkets.get(idx))
+                )
+            );
+        }
+
+        mp.run();
+        activeMarkets.clear();
+    }
+
+    /**
+     * @notice Processes all operations for a single market
+     * @dev Called in parallel for each market
+     * @param market CToken market address
+     */
+    function processMarket(address market) public {
+        // Step 1: Accrue interest ONCE for this market
+        ILendingCore(lendingCore).accrueInterestOnce(market);
+
+        // Step 2: Get net amounts
+        uint256 totalDeposits = depositTotals[market].get();
+        uint256 totalWithdraws = withdrawTotals[market].get();
+        uint256 totalBorrows = borrowTotals[market].get();
+        uint256 totalRepays = repayTotals[market].get();
+
+        // Step 3: Process supply operations (deposits/withdraws) with netting
+        ILendingCore(lendingCore).processSupplyOperations(
+            ILendingRequestStore(address(depositRequests[market])),
+            ILendingRequestStore(address(withdrawRequests[market])),
+            market,
+            totalDeposits,
+            totalWithdraws
+        );
+
+        // Step 4: Process borrow operations (borrows/repays) with netting
+        ILendingCore(lendingCore).processBorrowOperations(
+            ILendingRequestStore(address(borrowRequests[market])),
+            ILendingRequestStore(address(repayRequests[market])),
+            market,
+            totalBorrows,
+            totalRepays
+        );
+
+        emit BatchProcessed(
+            market,
+            totalDeposits,
+            totalWithdraws,
+            totalBorrows,
+            totalRepays
+        );
+
+        // Step 5: Reset for next batch
+        _resetMarket(market);
+    }
+
+    /**
+     * @notice Resets all tracking for a market
+     */
+    function _resetMarket(address market) internal {
+        depositRequests[market].clear();
+        withdrawRequests[market].clear();
+        borrowRequests[market].clear();
+        repayRequests[market].clear();
+
+        // Reset cumulative totals by creating new instances
+        depositTotals[market] = new U256Cumulative(0, type(uint256).max);
+        withdrawTotals[market] = new U256Cumulative(0, type(uint256).max);
+        borrowTotals[market] = new U256Cumulative(0, type(uint256).max);
+        repayTotals[market] = new U256Cumulative(0, type(uint256).max);
+    }
+
+    /**
+     * @notice Converts encoded bytes to address
+     */
+    function _parseAddr(bytes memory rawdata) internal pure returns (address) {
+        bytes20 resultAdr;
+        for (uint256 i = 0; i < 20; i++) {
+            resultAdr |= bytes20(rawdata[i]) >> (i * 8);
+        }
+        return address(uint160(resultAdr));
+    }
+}
