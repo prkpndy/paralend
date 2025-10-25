@@ -27,6 +27,9 @@ import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 contract LendingCore {
     using SafeERC20 for IERC20;
 
+    /// @notice Address of the LendingEngine that queues operations
+    address public lendingEngine;
+
     event DepositProcessed(
         address indexed user,
         address indexed market,
@@ -52,6 +55,15 @@ contract LendingCore {
 
     // Tracks which markets have accrued interest this block (prevents double accrual)
     mapping(address => uint256) private lastAccrualBlock;
+
+    /**
+     * @notice Constructor - sets the LendingEngine address
+     * @param _lendingEngine Address of the LendingEngine contract
+     */
+    constructor(address _lendingEngine) {
+        require(_lendingEngine != address(0), "invalid lending engine");
+        lendingEngine = _lendingEngine;
+    }
 
     /**
      * @notice Accrues interest for a market ONCE per block
@@ -153,24 +165,23 @@ contract LendingCore {
 
     /**
      * @notice Internal: processes a single deposit
-     * @dev Transfers tokens from user and mints cTokens
+     * @dev Transfers tokens from LendingEngine to CToken and mints cTokens
      */
     function _processDeposit(
         CToken cToken,
         address user,
         uint256 amount
     ) internal {
-        // Note: In production, tokens should already be in LendingEngine
-        // Transfer from engine to cToken
+        // Transfer underlying from LendingEngine to CToken
         address underlying = cToken.underlying();
-        IERC20(underlying).safeTransferFrom(user, address(cToken), amount);
+        IERC20(underlying).safeTransferFrom(lendingEngine, address(cToken), amount);
 
         // Calculate cTokens to mint using current exchange rate
         uint256 exchangeRate = cToken.exchangeRateStored();
         uint256 mintTokens = (amount * 1e18) / exchangeRate;
 
-        // Mint cTokens to user (this updates totalSupply and user balance)
-        // Note: This is simplified - in production, need to handle internal accounting
+        // Call CToken to update state (mint cTokens to user)
+        cToken.mintFromLendingCore(user, mintTokens);
 
         emit DepositProcessed(user, address(cToken), amount, mintTokens);
     }
@@ -184,25 +195,14 @@ contract LendingCore {
         address user,
         uint256 redeemTokens
     ) internal {
-        // Calculate underlying amount using current exchange rate
-        uint256 exchangeRate = cToken.exchangeRateStored();
-        uint256 redeemAmount = (redeemTokens * exchangeRate) / 1e18;
+        // Call CToken to update state (burn cTokens) and get redeem amount
+        uint256 redeemAmount = cToken.redeemFromLendingCore(user, redeemTokens);
 
-        // Burn cTokens and transfer underlying
-        // Note: This is simplified - in production, need to handle internal accounting
+        // Transfer underlying from CToken to user
         address underlying = cToken.underlying();
-        IERC20(underlying).safeTransferFrom(
-            address(cToken),
-            user,
-            redeemAmount
-        );
+        IERC20(underlying).safeTransferFrom(address(cToken), user, redeemAmount);
 
-        emit WithdrawProcessed(
-            user,
-            address(cToken),
-            redeemAmount,
-            redeemTokens
-        );
+        emit WithdrawProcessed(user, address(cToken), redeemAmount, redeemTokens);
     }
 
     /**
@@ -214,12 +214,13 @@ contract LendingCore {
         address user,
         uint256 amount
     ) internal {
-        // Note: In production, need to:
-        // 1. Check collateral ratio
-        // 2. Update accountBorrows mapping
-        // 3. Update totalBorrows
-        // 4. Transfer tokens to user
+        // TODO: Add collateral check (comptroller.borrowAllowed())
+        // For now, allow all borrows (unsafe for production!)
 
+        // Call CToken to update borrow state
+        cToken.borrowFromLendingCore(user, amount);
+
+        // Transfer underlying from CToken to user
         address underlying = cToken.underlying();
         IERC20(underlying).safeTransferFrom(address(cToken), user, amount);
 
@@ -235,14 +236,12 @@ contract LendingCore {
         address user,
         uint256 amount
     ) internal {
-        // Note: In production, need to:
-        // 1. Calculate actual repay amount (may be capped at user's borrow)
-        // 2. Update accountBorrows mapping
-        // 3. Update totalBorrows
-        // 4. Transfer tokens from user
-
+        // Transfer underlying from LendingEngine to CToken
         address underlying = cToken.underlying();
-        IERC20(underlying).safeTransferFrom(user, address(cToken), amount);
+        IERC20(underlying).safeTransferFrom(lendingEngine, address(cToken), amount);
+
+        // Call CToken to update repay state (handles capping at user's borrow)
+        cToken.repayFromLendingCore(user, amount);
 
         emit RepayProcessed(user, address(cToken), amount);
     }

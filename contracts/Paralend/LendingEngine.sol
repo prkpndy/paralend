@@ -6,9 +6,12 @@ import "@arcologynetwork/concurrentlib/lib/runtime/Runtime.sol";
 import "@arcologynetwork/concurrentlib/lib/commutative/U256Cum.sol";
 import "@arcologynetwork/concurrentlib/lib/multiprocess/Multiprocess.sol";
 import "@arcologynetwork/concurrentlib/lib/orderedset/OrderedSet.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "./LendingRequestStore.sol";
 import "./interfaces/ILendingCore.sol";
 import "./interfaces/ILendingRequestStore.sol";
+import "../CompoundV2/CToken.sol";
 
 /**
  * @title LendingEngine
@@ -35,6 +38,8 @@ import "./interfaces/ILendingRequestStore.sol";
  *   - Process 240 operations in parallel across 20 threads
  */
 contract LendingEngine {
+    using SafeERC20 for IERC20;
+
     // Address of core lending logic contract
     address private lendingCore;
 
@@ -98,8 +103,15 @@ contract LendingEngine {
 
     /**
      * @notice Initializes the lending core contract
+     * @dev Deployment order:
+     *      1. Deploy LendingEngine
+     *      2. Deploy LendingCore(lendingEngineAddress)
+     *      3. Call LendingEngine.init(lendingCoreAddress)
+     *      4. For each CToken: call cToken.setLendingCore(lendingCoreAddress)
      */
     function init(address _lendingCore) external {
+        require(lendingCore == address(0), "already initialized");
+        require(_lendingCore != address(0), "invalid address");
         lendingCore = _lendingCore;
     }
 
@@ -130,6 +142,10 @@ contract LendingEngine {
     ) external returns (uint256) {
         bytes32 pid = abi.decode(Runtime.pid(), (bytes32));
 
+        // Get underlying token and transfer from user to this contract
+        address underlying = CToken(market).underlying();
+        IERC20(underlying).safeTransferFrom(msg.sender, address(this), amount);
+
         // Track active market
         activeMarkets.set(abi.encodePacked(market));
 
@@ -138,9 +154,6 @@ contract LendingEngine {
 
         // Accumulate total
         depositTotals[market].add(amount);
-
-        // Transfer tokens to lending core
-        // Note: In production, add token transfer logic here
 
         // If in deferred phase, process all markets
         if (Runtime.isInDeferred()) {
@@ -204,6 +217,10 @@ contract LendingEngine {
         uint256 amount
     ) external returns (uint256) {
         bytes32 pid = abi.decode(Runtime.pid(), (bytes32));
+
+        // Get underlying token and transfer from user to this contract
+        address underlying = CToken(market).underlying();
+        IERC20(underlying).safeTransferFrom(msg.sender, address(this), amount);
 
         activeMarkets.set(abi.encodePacked(market));
         repayRequests[market].push(pid, msg.sender, amount);
