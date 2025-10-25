@@ -512,4 +512,108 @@ contract CToken is ExponentialNoError {
         // Emit transfer event (for ERC20 compatibility if needed)
         // Note: totalSupply unchanged - just transferring between accounts
     }
+
+    // ============================================
+    // NET AMOUNT OPTIMIZATION - NETTING FUNCTIONS
+    // ============================================
+
+    /**
+     * @notice Applies net supply change to totalSupply (called ONCE before processing individual operations)
+     * @dev This is the key optimization: update totalSupply once instead of per-operation
+     * @param netMintTokens Net amount of cTokens minted (deposits - withdraws in cToken units)
+     */
+    function applyNetSupply(int256 netMintTokens) external {
+        require(msg.sender == lendingCore, "unauthorized: only lending core");
+
+        if (netMintTokens > 0) {
+            // Net deposits: increase totalSupply
+            totalSupply = add_(totalSupply, uint256(netMintTokens));
+        } else if (netMintTokens < 0) {
+            // Net withdraws: decrease totalSupply
+            totalSupply = sub_(totalSupply, uint256(-netMintTokens));
+        }
+        // If netMintTokens == 0, no change needed
+    }
+
+    /**
+     * @notice Applies net borrow change to totalBorrows (called ONCE before processing individual operations)
+     * @dev This is the key optimization: update totalBorrows once instead of per-operation
+     * @param netBorrowAmount Net amount borrowed (borrows - repays in underlying units)
+     */
+    function applyNetBorrows(int256 netBorrowAmount) external {
+        require(msg.sender == lendingCore, "unauthorized: only lending core");
+
+        if (netBorrowAmount > 0) {
+            // Net borrows: increase totalBorrows
+            totalBorrows = add_(totalBorrows, uint256(netBorrowAmount));
+        } else if (netBorrowAmount < 0) {
+            // Net repays: decrease totalBorrows
+            totalBorrows = sub_(totalBorrows, uint256(-netBorrowAmount));
+        }
+        // If netBorrowAmount == 0, no change needed
+    }
+
+    /**
+     * @notice Updates user's cToken balance only (does NOT update totalSupply)
+     * @dev Used after applyNetSupply has already updated totalSupply
+     * @param user Address to mint tokens to
+     * @param mintTokens Amount of cTokens to mint
+     */
+    function mintTokensToUserOnly(address user, uint256 mintTokens) external {
+        require(msg.sender == lendingCore, "unauthorized: only lending core");
+        accountTokens[user] = add_(accountTokens[user], mintTokens);
+    }
+
+    /**
+     * @notice Updates user's cToken balance only (does NOT update totalSupply)
+     * @dev Used after applyNetSupply has already updated totalSupply
+     * @param user Address to redeem tokens from
+     * @param redeemTokens Amount of cTokens to redeem
+     */
+    function redeemTokensFromUserOnly(address user, uint256 redeemTokens) external {
+        require(msg.sender == lendingCore, "unauthorized: only lending core");
+        accountTokens[user] = sub_(accountTokens[user], redeemTokens);
+    }
+
+    /**
+     * @notice Updates user's borrow balance only (does NOT update totalBorrows)
+     * @dev Used after applyNetBorrows has already updated totalBorrows
+     * @param user Address borrowing
+     * @param borrowAmount Amount being borrowed
+     */
+    function borrowToUserOnly(address user, uint256 borrowAmount) external {
+        require(msg.sender == lendingCore, "unauthorized: only lending core");
+
+        uint256 accountBorrowsPrev = borrowBalanceStored(user);
+        uint256 accountBorrowsNew = add_(accountBorrowsPrev, borrowAmount);
+
+        accountBorrows[user].principal = accountBorrowsNew;
+        accountBorrows[user].interestIndex = borrowIndex;
+
+        emit Borrow(user, borrowAmount, accountBorrowsNew, totalBorrows);
+    }
+
+    /**
+     * @notice Updates user's borrow balance only (does NOT update totalBorrows)
+     * @dev Used after applyNetBorrows has already updated totalBorrows
+     * @param user Address repaying
+     * @param repayAmount Amount being repaid
+     */
+    function repayFromUserOnly(address user, uint256 repayAmount) external {
+        require(msg.sender == lendingCore, "unauthorized: only lending core");
+
+        uint256 accountBorrowsPrev = borrowBalanceStored(user);
+
+        // Cap repayAmount at user's actual borrow
+        if (repayAmount > accountBorrowsPrev) {
+            repayAmount = accountBorrowsPrev;
+        }
+
+        uint256 accountBorrowsNew = sub_(accountBorrowsPrev, repayAmount);
+
+        accountBorrows[user].principal = accountBorrowsNew;
+        accountBorrows[user].interestIndex = borrowIndex;
+
+        emit RepayBorrow(address(0), user, repayAmount, accountBorrowsNew, totalBorrows);
+    }
 }

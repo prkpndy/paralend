@@ -103,23 +103,35 @@ contract LendingCore {
 
     /**
      * @notice Processes deposit and withdraw operations with netting
-     * @dev Applies net change to totalSupply, then processes individual requests
+     * @dev Applies net change to totalSupply ONCE, then processes individual requests
      * @param depositStore All deposit requests for this market
      * @param withdrawStore All withdraw requests for this market
      * @param market CToken market address
-     * @param netDeposit Total deposit amount
-     * @param netWithdraw Total withdraw amount
+     * @param netDeposit Total deposit amount (in underlying tokens)
+     * @param netWithdraw Total withdraw amount (in cTokens)
      */
     function processSupplyOperations(
         ILendingRequestStore depositStore,
         ILendingRequestStore withdrawStore,
         address market,
-        // TODO: Check if netDeposit and netWithdraw arguments can be removed
         uint256 netDeposit,
         uint256 netWithdraw
     ) external {
         CToken cToken = CToken(market);
 
+        // KEY OPTIMIZATION: Calculate net mint tokens and apply to totalSupply ONCE
+        uint256 exchangeRate = cToken.exchangeRateStored();
+
+        // Convert netDeposit (underlying) to cTokens
+        uint256 netMintTokens = (netDeposit * 1e18) / exchangeRate;
+
+        // Calculate net change: mint - redeem
+        int256 netSupplyChange = int256(netMintTokens) - int256(netWithdraw);
+
+        // Apply net to totalSupply ONCE (instead of per-operation)
+        cToken.applyNetSupply(netSupplyChange);
+
+        // Now process individual user balances (WITHOUT updating totalSupply)
         // Process deposits
         if (address(depositStore) != address(0)) {
             uint256 depositCount = depositStore.fullLength();
@@ -127,7 +139,7 @@ contract LendingCore {
                 if (!depositStore.exists(i)) continue;
 
                 (, address user, uint256 amount) = depositStore.get(i);
-                _processDeposit(cToken, user, amount);
+                _processDepositOptimized(cToken, user, amount, exchangeRate);
             }
         }
 
@@ -138,30 +150,36 @@ contract LendingCore {
                 if (!withdrawStore.exists(i)) continue;
 
                 (, address user, uint256 amount) = withdrawStore.get(i);
-                _processWithdraw(cToken, user, amount);
+                _processWithdrawOptimized(cToken, user, amount);
             }
         }
     }
 
     /**
      * @notice Processes borrow and repay operations with netting
-     * @dev Applies net change to totalBorrows, then processes individual requests
+     * @dev Applies net change to totalBorrows ONCE, then processes individual requests
      * @param borrowStore All borrow requests for this market
      * @param repayStore All repay requests for this market
      * @param market CToken market address
-     * @param netBorrow Total borrow amount
-     * @param netRepay Total repay amount
+     * @param netBorrow Total borrow amount (in underlying tokens)
+     * @param netRepay Total repay amount (in underlying tokens)
      */
     function processBorrowOperations(
         ILendingRequestStore borrowStore,
         ILendingRequestStore repayStore,
         address market,
-        // TODO: Check if netBorrow and netWithdraw arguments can be removed
         uint256 netBorrow,
         uint256 netRepay
     ) external {
         CToken cToken = CToken(market);
 
+        // KEY OPTIMIZATION: Apply net to totalBorrows ONCE
+        int256 netBorrowChange = int256(netBorrow) - int256(netRepay);
+
+        // Apply net to totalBorrows ONCE (instead of per-operation)
+        cToken.applyNetBorrows(netBorrowChange);
+
+        // Now process individual user balances (WITHOUT updating totalBorrows)
         // Process borrows
         if (address(borrowStore) != address(0)) {
             uint256 borrowCount = borrowStore.fullLength();
@@ -169,7 +187,7 @@ contract LendingCore {
                 if (!borrowStore.exists(i)) continue;
 
                 (, address user, uint256 amount) = borrowStore.get(i);
-                _processBorrow(cToken, user, amount);
+                _processBorrowOptimized(cToken, user, amount);
             }
         }
 
@@ -180,7 +198,7 @@ contract LendingCore {
                 if (!repayStore.exists(i)) continue;
 
                 (, address user, uint256 amount) = repayStore.get(i);
-                _processRepay(cToken, user, amount);
+                _processRepayOptimized(cToken, user, amount);
             }
         }
     }
@@ -370,5 +388,113 @@ contract LendingCore {
             repayAmount,
             seizeTokens
         );
+    }
+
+    // ============================================
+    // OPTIMIZED INTERNAL FUNCTIONS (NET AMOUNTS)
+    // ============================================
+
+    /**
+     * @notice Internal: processes a single deposit (OPTIMIZED - user balance only)
+     * @dev Called after totalSupply already updated via applyNetSupply
+     * @param cToken The market
+     * @param user Address depositing
+     * @param amount Amount being deposited
+     * @param exchangeRate Current exchange rate (passed to avoid re-reading)
+     */
+    function _processDepositOptimized(
+        CToken cToken,
+        address user,
+        uint256 amount,
+        uint256 exchangeRate
+    ) internal {
+        // Transfer underlying from LendingEngine to CToken
+        address underlying = cToken.underlying();
+        IERC20(underlying).safeTransferFrom(lendingEngine, address(cToken), amount);
+
+        // Calculate cTokens to mint using passed exchange rate
+        uint256 mintTokens = (amount * 1e18) / exchangeRate;
+
+        // Update user balance only (totalSupply already updated)
+        cToken.mintTokensToUserOnly(user, mintTokens);
+
+        emit DepositProcessed(user, address(cToken), amount, mintTokens);
+    }
+
+    /**
+     * @notice Internal: processes a single withdraw (OPTIMIZED - user balance only)
+     * @dev Called after totalSupply already updated via applyNetSupply
+     * @param cToken The market
+     * @param user Address withdrawing
+     * @param redeemTokens Amount of cTokens being redeemed
+     */
+    function _processWithdrawOptimized(
+        CToken cToken,
+        address user,
+        uint256 redeemTokens
+    ) internal {
+        // Update user balance only (totalSupply already updated)
+        cToken.redeemTokensFromUserOnly(user, redeemTokens);
+
+        // Calculate underlying amount to transfer
+        uint256 exchangeRate = cToken.exchangeRateStored();
+        uint256 redeemAmount = (redeemTokens * exchangeRate) / 1e18;
+
+        // Transfer underlying from CToken to user
+        address underlying = cToken.underlying();
+        IERC20(underlying).safeTransferFrom(address(cToken), user, redeemAmount);
+
+        emit WithdrawProcessed(user, address(cToken), redeemAmount, redeemTokens);
+    }
+
+    /**
+     * @notice Internal: processes a single borrow (OPTIMIZED - user balance only)
+     * @dev Called after totalBorrows already updated via applyNetBorrows
+     * @param cToken The market
+     * @param user Address borrowing
+     * @param amount Amount being borrowed
+     */
+    function _processBorrowOptimized(
+        CToken cToken,
+        address user,
+        uint256 amount
+    ) internal {
+        // Check collateral using comptroller
+        require(address(comptroller) != address(0), "comptroller not set");
+        require(
+            comptroller.borrowAllowed(address(cToken), user, amount),
+            "insufficient collateral"
+        );
+
+        // Update user borrow balance only (totalBorrows already updated)
+        cToken.borrowToUserOnly(user, amount);
+
+        // Transfer underlying from CToken to user
+        address underlying = cToken.underlying();
+        IERC20(underlying).safeTransferFrom(address(cToken), user, amount);
+
+        emit BorrowProcessed(user, address(cToken), amount);
+    }
+
+    /**
+     * @notice Internal: processes a single repay (OPTIMIZED - user balance only)
+     * @dev Called after totalBorrows already updated via applyNetBorrows
+     * @param cToken The market
+     * @param user Address repaying
+     * @param amount Amount being repaid
+     */
+    function _processRepayOptimized(
+        CToken cToken,
+        address user,
+        uint256 amount
+    ) internal {
+        // Transfer underlying from LendingEngine to CToken
+        address underlying = cToken.underlying();
+        IERC20(underlying).safeTransferFrom(lendingEngine, address(cToken), amount);
+
+        // Update user borrow balance only (totalBorrows already updated)
+        cToken.repayFromUserOnly(user, amount);
+
+        emit RepayProcessed(user, address(cToken), amount);
     }
 }
