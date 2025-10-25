@@ -238,65 +238,89 @@ contract SimplifiedComptroller is ExponentialNoError {
 
         // Loop through all markets
         for (uint256 i = 0; i < allMarkets.length; i++) {
-            address cToken = allMarkets[i];
-
-            // Get user's balance in this market
-            (uint256 err, uint256 cTokenBalance, uint256 borrowBalance, uint256 exchangeRateMantissa) =
-                CToken(cToken).getAccountSnapshot(account);
+            (uint256 err, uint256 collateralValue, uint256 borrowValue) = _getMarketValues(
+                account,
+                allMarkets[i],
+                cTokenModify,
+                redeemTokens,
+                borrowAmount
+            );
 
             if (err != 0) {
                 return (err, 0, 0);
             }
 
-            // Get oracle price
-            uint256 oraclePrice = oraclePrices[cToken];
-            if (oraclePrice == 0) {
-                return (3, 0, 0); // Price error
-            }
-
-            // Calculate underlying balance: cTokenBalance * exchangeRate
-            uint256 underlyingBalance = mul_ScalarTruncate(
-                Exp({mantissa: exchangeRateMantissa}),
-                cTokenBalance
-            );
-
-            // If this is the market being modified, apply hypothetical changes
-            if (cToken == cTokenModify) {
-                // Calculate redeemAmount: redeemTokens * exchangeRate
-                uint256 redeemAmount = mul_ScalarTruncate(
-                    Exp({mantissa: exchangeRateMantissa}),
-                    redeemTokens
-                );
-
-                underlyingBalance = sub_(underlyingBalance, redeemAmount);
-                borrowBalance = add_(borrowBalance, borrowAmount);
-            }
-
-            // Calculate collateral value if market is entered
-            if (accountMembership[account][cToken]) {
-                // collateralValue = underlyingBalance * price * collateralFactor
-                uint256 collateralValue = mul_(underlyingBalance, oraclePrice) / 1e18;
-                collateralValue = mul_(collateralValue, collateralFactorMantissa) / 1e18;
-
-                sumCollateral = add_(sumCollateral, collateralValue);
-            }
-
-            // Calculate borrow value
-            // borrowValue = borrowBalance * price
-            uint256 borrowValue = mul_(borrowBalance, oraclePrice) / 1e18;
+            sumCollateral = add_(sumCollateral, collateralValue);
             sumBorrowPlusEffects = add_(sumBorrowPlusEffects, borrowValue);
         }
 
         // Calculate final liquidity or shortfall
         if (sumCollateral > sumBorrowPlusEffects) {
-            liquidity = sumCollateral - sumBorrowPlusEffects;
-            shortfall = 0;
+            return (0, sumCollateral - sumBorrowPlusEffects, 0);
         } else {
-            liquidity = 0;
-            shortfall = sumBorrowPlusEffects - sumCollateral;
+            return (0, 0, sumBorrowPlusEffects - sumCollateral);
+        }
+    }
+
+    /**
+     * @notice Internal helper to calculate collateral and borrow values for a single market
+     * @dev Reduces stack depth in getHypotheticalAccountLiquidity
+     */
+    function _getMarketValues(
+        address account,
+        address cToken,
+        address cTokenModify,
+        uint256 redeemTokens,
+        uint256 borrowAmount
+    )
+        internal
+        view
+        returns (
+            uint256 error,
+            uint256 collateralValue,
+            uint256 borrowValue
+        )
+    {
+        // Get user's balance in this market
+        (uint256 err, uint256 cTokenBalance, uint256 borrowBalance, uint256 exchangeRateMantissa) =
+            CToken(cToken).getAccountSnapshot(account);
+
+        if (err != 0) {
+            return (err, 0, 0);
         }
 
-        return (0, liquidity, shortfall);
+        // Get oracle price
+        uint256 oraclePrice = oraclePrices[cToken];
+        if (oraclePrice == 0) {
+            return (3, 0, 0); // Price error
+        }
+
+        // Calculate underlying balance and apply hypothetical changes
+        uint256 underlyingBalance = mul_ScalarTruncate(
+            Exp({mantissa: exchangeRateMantissa}),
+            cTokenBalance
+        );
+
+        if (cToken == cTokenModify) {
+            uint256 redeemAmount = mul_ScalarTruncate(
+                Exp({mantissa: exchangeRateMantissa}),
+                redeemTokens
+            );
+            underlyingBalance = sub_(underlyingBalance, redeemAmount);
+            borrowBalance = add_(borrowBalance, borrowAmount);
+        }
+
+        // Calculate collateral value if market is entered
+        collateralValue = 0;
+        if (accountMembership[account][cToken]) {
+            collateralValue = mul_(underlyingBalance, oraclePrice) / 1e18;
+            collateralValue = mul_(collateralValue, collateralFactorMantissa) / 1e18;
+        }
+
+        // Calculate borrow value
+        borrowValue = mul_(borrowBalance, oraclePrice) / 1e18;
+
+        return (0, collateralValue, borrowValue);
     }
 
     /**
