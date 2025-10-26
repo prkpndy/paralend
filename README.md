@@ -188,35 +188,35 @@ Time: 70ms total
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                   USER TRANSACTIONS                       │
-│   [Deposit] [Withdraw] [Borrow] [Repay] [Liquidate]     │
-│              (1000+ parallel operations)                  │
+│                   USER TRANSACTIONS                      │
+│   [Deposit] [Withdraw] [Borrow] [Repay] [Liquidate]      │
+│              (1000+ parallel operations)                 │
 └────────────────────────┬─────────────────────────────────┘
                          │
         PHASE 1: PARALLEL COLLECTION
                          │
                          ▼
 ┌──────────────────────────────────────────────────────────┐
-│              LENDING ENGINE (Batching Layer)              │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │  • Runtime.defer() registration                  │    │
-│  │  • LendingRequestStore (concurrent storage)      │    │
-│  │  • U256Cumulative (conflict-free accumulation)   │    │
-│  │  • BytesOrderedSet (active market tracking)      │    │
-│  │  • Token capture & validation                    │    │
-│  └─────────────────────────────────────────────────┘    │
+│              LENDING ENGINE (Batching Layer)             │
+│  ┌─────────────────────────────────────────────────┐     │
+│  │  • Runtime.defer() registration                 │     │
+│  │  • LendingRequestStore (concurrent storage)     │     │
+│  │  • U256Cumulative (conflict-free accumulation)  │     │
+│  │  • BytesOrderedSet (active market tracking)     │     │
+│  │  • Token capture & validation                   │     │
+│  └─────────────────────────────────────────────────┘     │
 └────────────────────────┬─────────────────────────────────┘
                          │
         PHASE 2: DEFERRED PROCESSING
                          │
                          ▼
 ┌──────────────────────────────────────────────────────────┐
-│           MULTIPROCESS (20 Parallel Threads)              │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
-│  │ Thread 1 │  │ Thread 2 │  │ Thread N │  ...         │
-│  │  Market  │  │  Market  │  │  Market  │              │
-│  │   DAI    │  │   USDC   │  │   ETH    │              │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘              │
+│           MULTIPROCESS (20 Parallel Threads)             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                │
+│  │ Thread 1 │  │ Thread 2 │  │ Thread N │  ...           │
+│  │  Market  │  │  Market  │  │  Market  │                │
+│  │   DAI    │  │   USDC   │  │   ETH    │                │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                │
 │       │             │             │                      │
 │       ▼             ▼             ▼                      │
 │  processMarket() for each market in parallel             │
@@ -224,24 +224,24 @@ Time: 70ms total
                          │
                          ▼
 ┌──────────────────────────────────────────────────────────┐
-│              LENDING CORE (Netting Logic)                 │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │  1. accrueInterestOnce() - Single calculation    │    │
-│  │  2. Calculate net flows:                         │    │
-│  │     • deposits - withdraws                       │    │
-│  │     • borrows - repays                           │    │
-│  │  3. Apply net to global state (1 write)          │    │
-│  │  4. Process users in parallel (N writes)         │    │
-│  └─────────────────────────────────────────────────┘    │
+│              LENDING CORE (Netting Logic)                │
+│  ┌─────────────────────────────────────────────────┐     │
+│  │  1. accrueInterestOnce() - Single calculation   │     │
+│  │  2. Calculate net flows:                        │     │
+│  │     • deposits - withdraws                      │     │
+│  │     • borrows - repays                          │     │
+│  │  3. Apply net to global state (1 write)         │     │
+│  │  4. Process users in parallel (N writes)        │     │
+│  └─────────────────────────────────────────────────┘     │
 └────────────────────────┬─────────────────────────────────┘
                          │
                          ▼
 ┌──────────────────────────────────────────────────────────┐
-│              CTOKEN (Compound V2 Core)                    │
-│  • Proven lending logic & security                        │
-│  • Interest rate models                                   │
-│  • Exchange rate calculations                             │
-│  • Borrow/supply tracking                                 │
+│              CTOKEN (Compound V2 Core)                   │
+│  • Proven lending logic & security                       │
+│  • Interest rate models                                  │
+│  • Exchange rate calculations                            │
+│  • Borrow/supply tracking                                │
 └──────────────────────────────────────────────────────────┘
 ```
 
